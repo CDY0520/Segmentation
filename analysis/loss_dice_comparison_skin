@@ -1,0 +1,984 @@
+#%% md
+## 환경설정
+#%%
+# ==================================================
+# 필수 라이브러리 임포트
+# ==================================================
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import to_rgba
+import seaborn as sns
+import pandas as pd
+import scipy.stats as stats
+from statsmodels.distributions.empirical_distribution import ECDF
+from statsmodels.stats.multitest import multipletests
+from scipy.stats import shapiro
+from scipy.stats import friedmanchisquare
+from scipy.stats import wilcoxon
+#%%
+# ==================================================
+# Google Drive 마운트
+# ==================================================
+
+from google.colab import drive
+drive.mount('/content/drive')
+#%% md
+## 전역변수 지정 먼저!!!!!!!!!!!!!!
+#%%
+# ==================================================
+# 전역변수를 먼저 지정해주세요 (1) - CSV 파일 경로
+# ==================================================
+
+# CSV 파일이 저장된 경로를 지정하고, 모든 파일명을 리스트로 저장하고 추출
+folder_path = '/content/drive/MyDrive/Colab Notebooks/loss_dice_per_test_images/skin_lesion'
+metrics_path = os.path.join(folder_path, 'individual_metrics')
+csv_files = sorted([f for f in os.listdir(metrics_path) if f.endswith('.csv')])
+
+# CSV 파일명을 dictionary의 key로 저장하고 출력하기
+print(f"\n\n📁 Found {len(csv_files)} CSV file(s) in: '{metrics_path}'\n")
+model_file_map = {f: None for f in csv_files}
+for f in csv_files:
+    print(f"    '{f}': None,")
+#%%
+# ==================================================
+# 전역변수를 먼저 지정해주세요 (2) - 모델, 데이터셋, 시각화 색상
+# ==================================================
+
+# 사용자가 지정한 모델명을 리스트로 저장 (model_file_map에 저장된 key와 매칭되는 순서에 유의)
+model_names = [
+    'UNet++',
+    'Attention UNet',
+    'Attention UNet++',
+    'TransUNet'
+]
+
+# 데이터셋 tag 지정
+dataset_tag = "skin Lesion"
+tag_slug = dataset_tag.lower().replace('-', '_').replace(' ', '_')
+
+# 시각화에 사용될 색상을 seaborn 팔레트에서 추출하여 모델별로 지정
+# viridis
+color_list_1 = sns.color_palette("viridis", n_colors=len(model_names))
+model_palette_1 = dict(zip(model_names, color_list_1))
+
+# flare
+color_list_2 = sns.color_palette("flare", n_colors=len(model_names))
+model_palette_2 = dict(zip(model_names, color_list_2))
+#%%
+# ==================================================
+# 전역변수를 먼저 지정해주세요 (3) - 자료저장경로
+# ==================================================
+
+# 시각화 및 통계 자료 저장될 경로 설정
+save_viz_dir = os.path.join(folder_path, 'visualizations')
+save_stat_dir = os.path.join(folder_path, 'statistics')
+
+# 디렉토리 생성 (없으면 새로 생성)
+os.makedirs(save_viz_dir, exist_ok=True)
+os.makedirs(save_stat_dir, exist_ok=True)
+
+print("\n\n📂 Save Directory Paths:")
+print("    📁 Visualization folder:", save_viz_dir)
+print("    📁 Statistics folder   :", save_stat_dir)
+#%% md
+## Dice 및 IoU 데이터 구성
+#%%
+# ==================================================
+# CSV 파일명에 모델명 매핑
+# ==================================================
+
+# model_name을 model_file_map의 value에 할당
+for i, key in enumerate(model_file_map.keys()):
+    model_file_map[key] = model_names[i]
+
+# 매핑 결과 출력
+print("\n\n" + "=" * 65)
+print("📌 Mapping of CSV filenames to model display names:")
+print("=" * 65 + "\n")
+print(f"{'CSV File':45} | {'Model Name'}")
+print("-" * 65)
+for k, v in model_file_map.items():
+    print(f"{k:45} | {v}")
+#%%
+# ==================================================
+# Dice, IoU끼리 데이터 병합
+# ==================================================
+
+# 📊 결과 저장용 리스트
+dice_data = []
+iou_data = []
+
+# 📥 모든 CSV 파일에서 Dice, IoU 각각 불러와서 index 및 model 붙이기
+for file_name, model_name in model_file_map.items():
+    file_path = os.path.join(metrics_path, file_name)
+
+    try:
+        df = pd.read_csv(file_path)
+
+        df_dice = pd.DataFrame({
+            'image_index': range(len(df)),
+            'Model': model_name,
+            'Dice': df['Dice']
+        })
+
+        df_iou = pd.DataFrame({
+            'image_index': range(len(df)),
+            'Model': model_name,
+            'IoU': df['IoU']
+        })
+
+        dice_data.append(df_dice)
+        iou_data.append(df_iou)
+
+    except Exception as e:
+        print(f"❌ Error reading {file_name}: {e}")
+
+# 🧱 병합
+df_dice = pd.concat(dice_data, ignore_index=True)
+df_iou = pd.concat(iou_data, ignore_index=True)
+
+for name, df in [('df_dice', df_dice), ('df_iou', df_iou)]:
+    print("\n\n" + "=" * 65)
+    print(f"📂 Structure of {name}")
+    print("=" * 65 + "\n")
+
+    print(f"🔢 shape      : {df.shape}")
+    print(f"📝 columns    : {df.columns.tolist()}")
+
+    print("\n👀 Preview (Top 5 rows):")
+    print(df.head())
+
+    print("\n🔧 Data types:")
+    print(df.dtypes)
+#%% md
+## 자료저장 관련 함수
+#%%
+# ==================================================
+# 파일명 번호 붙이기 (시각화 자료용)
+# ==================================================
+
+def get_unique_viz_filename(directory, base_filename, extension=".png"):
+    """
+    중복되지 않는 파일명을 반환합니다.
+    예: base_filename="violin_dice_chest_x_ray" →
+        violin_dice_chest_x_ray.png
+        violin_dice_chest_x_ray_001.png
+        violin_dice_chest_x_ray_002.png ...
+    """
+    # 첫 번째 후보 (중복 없으면 그대로 사용)
+    full_path = os.path.join(directory, base_filename + extension)
+    if not os.path.exists(full_path):
+        return full_path
+
+    # 중복이면 _001, _002 ... 붙이기
+    counter = 1
+    while True:
+        suffix = f"_{counter:03d}"        # 001, 002, ...
+        full_path = os.path.join(directory, f"{base_filename}{suffix}{extension}")
+        if not os.path.exists(full_path):
+            return full_path
+        counter += 1
+#%%
+# ==================================================
+# 파일명 번호 붙이기 (통계 자료용)
+# ==================================================
+
+def get_unique_stat_filename(directory, base_filename, extension=".csv"):
+    """
+    중복되지 않는 통계 결과 파일명을 반환합니다.
+    예: base_filename="shapiro_dice_chest_x_ray" →
+        shapiro_dice_chest_x_ray.csv
+        shapiro_dice_chest_x_ray_001.csv
+        shapiro_dice_chest_x_ray_002.csv ...
+    """
+    # 첫 번째 후보 (중복 없으면 그대로 사용)
+    full_path = os.path.join(directory, base_filename + extension)
+    if not os.path.exists(full_path):
+        return full_path
+
+    # 중복이면 _001, _002 ... 붙이기
+    counter = 1
+    while True:
+        suffix = f"_{counter:03d}"        # 001, 002, ...
+        full_path = os.path.join(directory, f"{base_filename}{suffix}{extension}")
+        if not os.path.exists(full_path):
+            return full_path
+        counter += 1
+#%% md
+## 통계분석
+#%%
+# ==================================================
+# Shapiro-Wilk test - 정규분포여부 테스트 (소규모 sample)
+# ==================================================
+
+# 저장경로 생성
+file_shapiro_dice = get_unique_stat_filename(save_stat_dir, f"shapiro_dice_{tag_slug}")
+file_shapiro_iou  = get_unique_stat_filename(save_stat_dir, f"shapiro_iou_{tag_slug}")
+
+# Dice
+results_dice = []
+for model in df_dice['Model'].unique():
+    vals = df_dice[df_dice['Model'] == model]['Dice']
+    stat, p = shapiro(vals)
+    results_dice.append({
+        'Model': model,
+        'W-statistic': stat,
+        'p-value (float)': f"{p:.5f}",
+        'p-value (sci)': f"{p:.2e}",
+        'Normal': '✅ Yes' if p > 0.05 else '❌ No'
+    })
+
+df_normal_dice = pd.DataFrame(results_dice)
+df_normal_dice.to_csv(file_shapiro_dice, index=False)
+
+# IoU
+results_iou = []
+for model in df_iou['Model'].unique():
+    vals = df_iou[df_iou['Model'] == model]['IoU']
+    stat, p = shapiro(vals)
+    results_iou.append({
+        'Model': model,
+        'W-statistic': stat,
+        'p-value (round)': f"{p:.5f}",
+        'p-value (sci)': f"{p:.2e}",
+        'Normal': '✅ Yes' if p > 0.05 else '❌ No'
+    })
+
+df_normal_iou = pd.DataFrame(results_iou)
+df_normal_iou.to_csv(file_shapiro_iou, index=False)
+
+# 결과 확인
+print("\n\n📊 Dice normality summary:")
+print(df_normal_dice)
+
+print("\n\n📊 IoU normality summary:")
+print(df_normal_iou)
+
+# 저장
+print("\n\n✅ Shapiro-Wilk results saved:")
+print(f"    📄 Dice Shapiro-Wilk → {file_shapiro_dice}")
+print(f"    📄 IoU Shapiro-Wilk  → {file_shapiro_iou}")
+#%%
+# ==================================================
+# Q-Q Plot: Dice & IoU - 정규성 시각화
+# ==================================================
+
+# 저장경로 생성
+file_qq_dice = get_unique_viz_filename(save_viz_dir, f"qq_dice_{tag_slug}")
+file_qq_iou  = get_unique_viz_filename(save_viz_dir, f"qq_iou_{tag_slug}")
+
+# Dice Box Plot
+models = df_dice['Model'].unique()
+ncols = 3
+nrows = -(-len(models) // ncols)
+
+plt.figure(figsize=(ncols * 4, nrows * 4))
+for i, model in enumerate(models, 1):
+    plt.subplot(nrows, ncols, i)
+    data = df_dice[df_dice['Model'] == model]['Dice']
+    stats.probplot(data, dist="norm", plot=plt)
+    plt.title(model)
+plt.suptitle(f"Q-Q Plots of Dice - {dataset_tag}", fontsize=16)
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig(file_qq_dice, dpi=300)
+plt.show()
+
+# IoU Box Plot
+models = df_iou['Model'].unique()
+ncols = 3
+nrows = -(-len(models) // ncols)
+
+plt.figure(figsize=(ncols * 4, nrows * 4))
+for i, model in enumerate(models, 1):
+    plt.subplot(nrows, ncols, i)
+    data = df_iou[df_iou['Model'] == model]['IoU']
+    stats.probplot(data, dist="norm", plot=plt)
+    plt.title(model)
+plt.suptitle(f"Q-Q Plots of IoU - {dataset_tag}", fontsize=16)
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig(file_qq_iou, dpi=300)
+plt.show()
+
+# 저장
+print("\n\n✅ Q-Q plots saved successfully:")
+print(f"    📁 Dice Q-Q Plot → {file_qq_dice}")
+print(f"    📁 IoU Q-Q Plot  → {file_qq_iou}")
+#%%
+# ==================================================
+# Friedman Test (3개↑ 모델 비교, 비모수)
+# ==================================================
+
+# 저장경로 생성
+file_friedman = get_unique_stat_filename(save_stat_dir, f"friedman_{tag_slug}")
+
+# Dice pivot
+pivot_dice = df_dice.pivot(index='image_index', columns='Model', values='Dice')
+scores_dice = [pivot_dice[col].values for col in pivot_dice.columns]
+stat_dice, p_dice = friedmanchisquare(*scores_dice)
+
+# IoU pivot
+pivot_iou = df_iou.pivot(index='image_index', columns='Model', values='IoU')
+scores_iou = [pivot_iou[col].values for col in pivot_iou.columns]
+stat_iou, p_iou = friedmanchisquare(*scores_iou)
+
+# 결과 DataFrame 생성
+df_friedman = pd.DataFrame({
+    'Metric'     : ['Dice', 'IoU'],
+    'Statistic'  : [stat_dice, stat_iou],
+    'p-value (round)': [f"{p_dice:.5f}", f"{p_iou:.5f}"],
+    'p-value (sci)'  : [f"{p_dice:.2e}", f"{p_iou:.2e}"],
+    'Significant': ['✅ Yes' if p < 0.05 else '❌ No' for p in [p_dice, p_iou]]
+})
+df_friedman.to_csv(file_friedman, index=False)
+
+# 결과 확인
+print("\n\n📊 Friedman Test Summary")
+print(df_friedman)
+
+# 저장
+print("\n\n✅ Friedman test results saved:")
+print(f"    📄 Friedman CSV → {file_friedman}")
+#%%
+# ==================================================
+# Post-hoc Analysis - Wilcoxon Signed-Rank Test
+# ==================================================
+
+# 저장경로 생성
+file_wilcoxon_sr_dice = get_unique_stat_filename(save_stat_dir, f"wilcoxon_sr_dice_{tag_slug}")
+file_wilcoxon_sr_iou = get_unique_stat_filename(save_stat_dir, f"wilcoxon_sr_iou_{tag_slug}")
+
+# Dice 기준 Wilcoxon Signed-Rank 사후분석
+pivot_dice = df_dice.pivot(index='image_index', columns='Model', values='Dice')
+models = pivot_dice.columns.tolist()
+
+results_dice = []
+for i in range(len(models)):
+    for j in range(i + 1, len(models)):
+        a, b = models[i], models[j]
+        stat, p = wilcoxon(pivot_dice[a], pivot_dice[b])
+        results_dice.append({
+            'Model A': a,
+            'Model B': b,
+            'p-value (float)': p,
+            'p-value (sci)': f"{p:.2e}",
+            'p-value (round)': f"{p:.5f}"
+        })
+
+df_wilcoxon_dice = pd.DataFrame(results_dice)
+
+# 다중보정 - Dice
+_, p_bonf, _, _ = multipletests(df_wilcoxon_dice['p-value (float)'], method='bonferroni')
+_, p_holm, _, _ = multipletests(df_wilcoxon_dice['p-value (float)'], method='holm')
+_, p_fdr, _, _ = multipletests(df_wilcoxon_dice['p-value (float)'], method='fdr_bh')
+
+df_wilcoxon_dice['Bonferroni p'] = p_bonf
+df_wilcoxon_dice['Bonferroni ✓'] = ['✅ Yes' if p < 0.05 else '❌ No' for p in p_bonf]
+df_wilcoxon_dice['Holm p'] = p_holm
+df_wilcoxon_dice['Holm ✓'] = ['✅ Yes' if p < 0.05 else '❌ No' for p in p_holm]
+df_wilcoxon_dice['FDR p'] = p_fdr
+df_wilcoxon_dice['FDR ✓'] = ['✅ Yes' if p < 0.05 else '❌ No' for p in p_fdr]
+
+df_wilcoxon_dice.to_csv(file_wilcoxon_sr_dice, index=False)
+
+# IoU 기준 Wilcoxon Signed-Rank 사후분석
+pivot_iou = df_iou.pivot(index='image_index', columns='Model', values='IoU')
+models_iou = pivot_iou.columns.tolist()
+
+results_iou = []
+for i in range(len(models_iou)):
+    for j in range(i + 1, len(models_iou)):
+        a, b = models_iou[i], models_iou[j]
+        stat, p = wilcoxon(pivot_iou[a], pivot_iou[b])
+        results_iou.append({
+            'Model A': a,
+            'Model B': b,
+            'p-value (float)': p,
+            'p-value (sci)': f"{p:.2e}",
+            'p-value (round)': f"{p:.5f}"
+        })
+
+df_wilcoxon_iou = pd.DataFrame(results_iou)
+
+# 다중보정 - IoU
+_, p_bonf_i, _, _ = multipletests(df_wilcoxon_iou['p-value (float)'], method='bonferroni')
+_, p_holm_i, _, _ = multipletests(df_wilcoxon_iou['p-value (float)'], method='holm')
+_, p_fdr_i, _, _ = multipletests(df_wilcoxon_iou['p-value (float)'], method='fdr_bh')
+
+df_wilcoxon_iou['Bonferroni p'] = p_bonf_i
+df_wilcoxon_iou['Bonferroni ✓'] = ['✅ Yes' if p < 0.05 else '❌ No' for p in p_bonf_i]
+df_wilcoxon_iou['Holm p'] = p_holm_i
+df_wilcoxon_iou['Holm ✓'] = ['✅ Yes' if p < 0.05 else '❌ No' for p in p_holm_i]
+df_wilcoxon_iou['FDR p'] = p_fdr_i
+df_wilcoxon_iou['FDR ✓'] = ['✅ Yes' if p < 0.05 else '❌ No' for p in p_fdr_i]
+
+df_wilcoxon_iou.to_csv(file_wilcoxon_sr_iou, index=False)
+
+# 결과 확인
+print("\n📊 Bonferroni-corrected p-values (Dice):\n")
+for a, b, p_raw, p_corr, sig in zip(
+    df_wilcoxon_dice['Model A'],
+    df_wilcoxon_dice['Model B'],
+    df_wilcoxon_dice['p-value (round)'],
+    df_wilcoxon_dice['Bonferroni p'],
+    df_wilcoxon_dice['Bonferroni ✓']
+):
+    print(f"🔹 {a} vs {b} → raw: {p_raw}, corrected: {p_corr:.5f}, significant: {sig}")
+
+print("\n\n📊 Holm-corrected p-values (Dice):\n")
+for a, b, p_raw, p_corr, sig in zip(
+    df_wilcoxon_dice['Model A'],
+    df_wilcoxon_dice['Model B'],
+    df_wilcoxon_dice['p-value (round)'],
+    df_wilcoxon_dice['Holm p'],
+    df_wilcoxon_dice['Holm ✓']
+):
+    print(f"🔸 {a} vs {b} → raw: {p_raw}, corrected: {p_corr:.5f}, significant: {sig}")
+
+print("\n\n📊 FDR-corrected p-values (Dice):\n")
+for a, b, p_raw, p_corr, sig in zip(
+    df_wilcoxon_dice['Model A'],
+    df_wilcoxon_dice['Model B'],
+    df_wilcoxon_dice['p-value (round)'],
+    df_wilcoxon_dice['FDR p'],
+    df_wilcoxon_dice['FDR ✓']
+):
+    print(f"🟡 {a} vs {b} → raw: {p_raw}, corrected: {p_corr:.5f}, significant: {sig}")
+
+print("\n\n📊 Bonferroni-corrected p-values (IoU):\n")
+for a, b, p_raw, p_corr, sig in zip(
+    df_wilcoxon_iou['Model A'],
+    df_wilcoxon_iou['Model B'],
+    df_wilcoxon_iou['p-value (round)'],
+    df_wilcoxon_iou['Bonferroni p'],
+    df_wilcoxon_iou['Bonferroni ✓']
+):
+    print(f"🔹 {a} vs {b} → raw: {p_raw}, corrected: {p_corr:.5f}, significant: {sig}")
+
+print("\n\n📊 Holm-corrected p-values (IoU):\n")
+for a, b, p_raw, p_corr, sig in zip(
+    df_wilcoxon_iou['Model A'],
+    df_wilcoxon_iou['Model B'],
+    df_wilcoxon_iou['p-value (round)'],
+    df_wilcoxon_iou['Holm p'],
+    df_wilcoxon_iou['Holm ✓']
+):
+    print(f"🔸 {a} vs {b} → raw: {p_raw}, corrected: {p_corr:.5f}, significant: {sig}")
+
+print("\n\n📊 FDR-corrected p-values (IoU):\n")
+for a, b, p_raw, p_corr, sig in zip(
+    df_wilcoxon_iou['Model A'],
+    df_wilcoxon_iou['Model B'],
+    df_wilcoxon_iou['p-value (round)'],
+    df_wilcoxon_iou['FDR p'],
+    df_wilcoxon_iou['FDR ✓']
+):
+    print(f"🟡 {a} vs {b} → raw: {p_raw}, corrected: {p_corr:.5f}, significant: {sig}")
+
+# 저장
+print("\n\n✅ Wilcoxon multiple correction results saved successfully:")
+print("    📄 Dice Wilcoxon multiple correction →", file_wilcoxon_sr_dice)
+print("    📄 IoU  Wilcoxon multiple correction →", file_wilcoxon_sr_iou)
+#%%
+# ==================================================
+# Heatmap (p-value matrix)
+# ==================================================
+
+def plot_pvalue_heatmap(df_result, metric_name, p_col=None, title_tag=None, heatmap_store_list=None):
+    """
+    Wilcoxon 사후분석 결과로부터 p-value heatmap 시각화 (보정된 p-value 사용)
+
+    Parameters:
+    - df_result     : DataFrame with columns ['Model A', 'Model B', p_col]
+    - metric_name   : str, e.g. 'Dice' or 'IoU'
+    - p_col         : str, 보정된 p-value 컬럼명 ('Bonferroni p', 'Holm p', 'FDR p')
+    - title_tag     : str, plot 제목에 붙을 보정 방식명
+    - heatmap_store_list: 저장된 파일 경로 리스트를 담을 외부 list
+    """
+
+    # 빈 매트릭스 생성
+    models = sorted(set(df_result['Model A']).union(df_result['Model B']))
+    heatmap_data = pd.DataFrame(index=models, columns=models, dtype=float)
+
+    for _, row in df_result.iterrows():
+        a, b = row['Model A'], row['Model B']
+        p_val = row[p_col]
+        heatmap_data.loc[a, b] = p_val
+        heatmap_data.loc[b, a] = p_val
+
+    # 시각화
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(
+        heatmap_data.astype(float),
+        annot=True, fmt=".3f", cmap="coolwarm_r",
+        linewidths=0.5, square=True, cbar_kws={'label': 'p-value'},
+        vmin=0, vmax=0.05
+    )
+    plt.title(f"Wilcoxon Signed-Rank Post-hoc Analysis ({title_tag} Correction)\n{metric_name} Scores - {dataset_tag}", fontsize=14)
+    plt.xticks(rotation=30)
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+
+    # 저장 옵션
+    file_heatmap = get_unique_viz_filename(save_viz_dir, f"heatmap_{title_tag}_{metric_name.lower()}_{tag_slug}")
+    plt.savefig(file_heatmap, dpi=300)
+    plt.show()
+
+    if heatmap_store_list is not None:
+        heatmap_store_list.append((title_tag, file_heatmap))
+
+# 저장경로 추
+heatmap_files_dice = []
+heatmap_files_iou = []
+
+# Dice
+plot_pvalue_heatmap(df_result=df_wilcoxon_dice, metric_name='Dice', p_col='Bonferroni p', title_tag='Bonferroni', heatmap_store_list=heatmap_files_dice)
+plot_pvalue_heatmap(df_result=df_wilcoxon_dice, metric_name='Dice', p_col='Holm p', title_tag='Holm', heatmap_store_list=heatmap_files_dice)
+plot_pvalue_heatmap(df_result=df_wilcoxon_dice, metric_name='Dice', p_col='FDR p', title_tag='FDR', heatmap_store_list=heatmap_files_dice)
+
+# IoU
+plot_pvalue_heatmap(df_result=df_wilcoxon_iou, metric_name='IoU', p_col='Bonferroni p', title_tag='Bonferroni', heatmap_store_list=heatmap_files_iou)
+plot_pvalue_heatmap(df_result=df_wilcoxon_iou, metric_name='IoU', p_col='Holm p', title_tag='Holm', heatmap_store_list=heatmap_files_iou)
+plot_pvalue_heatmap(df_result=df_wilcoxon_iou, metric_name='IoU', p_col='FDR p', title_tag='FDR', heatmap_store_list=heatmap_files_iou)
+
+# 저장
+print("\n\n✅ Heatmaps saved successfully:")
+print(f"\n    📁 Dice Heatmaps:")
+for tag, path in heatmap_files_dice:
+    print(f"    🔹 {tag} → {path}")
+print(f"\n    📁 IoU  Heatmaps:")
+for tag, path in heatmap_files_iou:
+    print(f"    🔸 {tag} → {path}")
+#%%
+# ==================================================
+# Dice & IoU Average Rank
+# ==================================================
+
+# 저장경로 생성
+file_avg_rank_dice = get_unique_stat_filename(save_stat_dir, f"avg_rank_dice_{tag_slug}")
+file_avg_rank_iou = get_unique_stat_filename(save_stat_dir, f"avg_rank_iou_{tag_slug}")
+
+# 이미지별 성능 Pivot (Dice / IoU)
+pivot_dice = df_dice.pivot(index='image_index', columns='Model', values='Dice')
+pivot_iou  = df_iou.pivot(index='image_index', columns='Model', values='IoU')
+
+# 이미지 단위 rank 계산 (점수가 높을수록 더 좋은 순위)
+ranks_dice = pivot_dice.rank(axis=1, method='average', ascending=False)
+ranks_iou  = pivot_iou.rank(axis=1, method='average', ascending=False)
+
+# 모델별 평균 rank 계산
+mean_ranks_dice = ranks_dice.mean().sort_values()
+mean_ranks_iou  = ranks_iou.mean().sort_values()
+
+# 출력
+print("\n📊 Average Ranks (Dice):")
+print(mean_ranks_dice)
+
+print("\n📊 Average Ranks (IoU):")
+print(mean_ranks_iou)
+
+# 저장
+mean_ranks_dice.to_csv(file_avg_rank_dice, index=True, header=['Dice_Avg_Rank'])
+mean_ranks_iou.to_csv(file_avg_rank_iou, index=True, header=['IoU_Avg_Rank'])
+
+print("\n\n✅ Average Rank saved successfully:")
+print("    📁 Dice Average Rank →", file_avg_rank_dice)
+print("    📁 IoU  Average Rank →", file_avg_rank_iou)
+#%%
+# ==================================================
+# Bar Plot: Dice & IoU Average Rank
+# ==================================================
+
+# 저장경로 생성
+file_avg_rank_bar_dice = get_unique_viz_filename(save_viz_dir, f"avg_rank_bar_dice_{tag_slug}")
+file_avg_rank_bar_iou  = get_unique_viz_filename(save_viz_dir, f"avg_rank_bar_iou_{tag_slug}")
+
+y_pos = np.linspace(0, 1, len(models))
+
+# Dice Average Rank
+plt.figure(figsize=(8, 5))
+plt.barh(
+    y=y_pos,
+    width=mean_ranks_dice.values,
+    height=0.2,
+    color=[to_rgba(model_palette_1[model], alpha=0.4) for model in models]
+)
+plt.yticks(ticks=y_pos, labels=models)
+plt.title(f'Average Rank per Model (Dice) - {dataset_tag}')
+plt.xlabel('Average Rank (Lower is Better)')
+plt.tight_layout()
+for val, y in zip(mean_ranks_dice.values, y_pos):
+    plt.text(val - 0.05, y, f"{val:.2f}", va='center', ha='right', color='black', fontsize=10)
+plt.show()
+
+# IoU Average Rank
+plt.figure(figsize=(8, 5))
+plt.barh(
+    y=y_pos,
+    width=mean_ranks_iou.values,
+    height=0.2,
+    color=[to_rgba(model_palette_2[model], alpha=0.4) for model in models]
+)
+plt.yticks(ticks=y_pos, labels=models)
+plt.title(f'Average Rank per Model (IoU) - {dataset_tag}')
+plt.xlabel('Average Rank (Lower is Better)')
+plt.tight_layout()
+for val, y in zip(mean_ranks_iou.values, y_pos):
+    plt.text(val - 0.05, y, f"{val:.2f}", va='center', ha='right', color='black', fontsize=10)
+plt.show()
+
+# 저장
+print("\n\n✅ Average Rank Bar plots saved successfully:")
+print(f"    📁 Dice Violin Plot → {file_avg_rank_dice}")
+print(f"    📁 IoU  Violin Plot → {file_avg_rank_iou}")
+#%% md
+## 정성적 시각화 자료 출력 및 저장
+#%%
+# ==================================================
+# Box Plot: Dice & IoU
+# ==================================================
+
+# 저장경로 생성
+file_box_dice = get_unique_viz_filename(save_viz_dir, f"box_dice_{tag_slug}")
+file_box_iou  = get_unique_viz_filename(save_viz_dir, f"box_iou_{tag_slug}")
+
+# Dice Box Plot
+plt.figure(figsize=(8, 5))
+sns.boxplot(
+    x='Model', y='Dice', data=df_dice,
+    hue='Model', palette=model_palette_1,
+    legend=False
+)
+plt.grid(True, linestyle='--', linewidth=0.7, alpha=0.9)
+plt.title(f'Box Plot of Dice Scores - {dataset_tag}')
+plt.xticks(rotation=20)
+plt.tight_layout()
+plt.savefig(file_box_dice, dpi=300)
+plt.show()
+
+# IoU Box Plot
+plt.figure(figsize=(8, 5))
+sns.boxplot(
+    x='Model', y='IoU', data=df_iou,
+    hue='Model', palette=model_palette_2,
+    legend=False
+)
+plt.grid(True, linestyle='--', linewidth=0.7, alpha=0.9)
+plt.title(f'Box Plot of IoU Scores - {dataset_tag}')
+plt.xticks(rotation=20)
+plt.tight_layout()
+plt.savefig(file_box_iou, dpi=300)
+plt.show()
+
+# 저장
+print("\n\n✅ Box plots saved successfully:")
+print(f"    📁 Dice Box Plot → {file_box_dice}")
+print(f"    📁 IoU  Box Plot → {file_box_iou}")
+#%%
+# ==================================================
+# Violin Plot: Dice & IoU
+# ==================================================
+
+# 저장 경로 준비
+file_vio_dice = get_unique_viz_filename(save_viz_dir, f"violin_dice_{tag_slug}")
+file_vio_iou  = get_unique_viz_filename(save_viz_dir, f"violin_iou_{tag_slug}")
+
+# Dice Violin Plot
+plt.figure(figsize=(8, 5))
+sns.violinplot(
+    x='Model', y='Dice', data=df_dice,
+    hue='Model', palette=model_palette_1,
+    inner='box', legend=False
+)
+plt.title(f'Violin Plot of Dice Scores - {dataset_tag}')
+plt.xticks(rotation=20)
+plt.tight_layout()
+plt.savefig(file_vio_dice, dpi=300)
+plt.show()
+
+# IoU Violin Plot
+plt.figure(figsize=(8, 5))
+sns.violinplot(
+    x='Model', y='IoU', data=df_iou,
+    hue='Model', palette=model_palette_2,
+    inner='box', legend=False
+)
+plt.title(f'Violin Plot of IoU Scores - {dataset_tag}')
+plt.xticks(rotation=20)
+plt.tight_layout()
+plt.savefig(file_vio_iou, dpi=300)
+plt.show()
+
+# 저장
+print("\n\n✅ Violin plots saved successfully:")
+print(f"    📁 Dice Violin Plot → {file_vio_dice}")
+print(f"    📁 IoU  Violin Plot → {file_vio_iou}")
+#%%
+# ==================================================
+# Violin + Box Plot: Dice & IoU
+# ==================================================
+
+# 저장 경로 준비
+file_vio_box_dice = get_unique_viz_filename(save_viz_dir, f"vio_box_dice_{tag_slug}")
+file_vio_box_iou  = get_unique_viz_filename(save_viz_dir, f"vio_box_iou_{tag_slug}")
+
+# Dice Violin + Box Plot
+plt.figure(figsize=(8, 5))
+sns.violinplot(
+    y='Model', x='Dice', data=df_dice,
+    palette=model_palette_1, hue='Model',
+    linewidth=0, alpha=0.4, inner=None,
+    dodge=False, legend=False
+)
+sns.boxplot(
+    y='Model', x='Dice', data=df_dice,
+    palette=model_palette_1, hue='Model',
+    width=0.25, fliersize=2, linewidth=1.2,
+    dodge=False, legend=False
+)
+plt.grid(True, linestyle='--', linewidth=0.7, alpha=0.9)
+plt.title(f'Violin + Box Plot of Dice Scores - {dataset_tag}')
+plt.xlabel('Dice')
+plt.ylabel('Model')
+plt.tight_layout()
+plt.savefig(file_vio_dice, dpi=300)
+plt.show()
+
+# IoU Violin + Box  Plot
+plt.figure(figsize=(8, 5))
+sns.violinplot(
+    y='Model', x='IoU', data=df_iou,
+    palette=model_palette_2, hue='Model',
+    linewidth=0, alpha=0.4, inner=None,
+    dodge=False, legend=False
+)
+sns.boxplot(
+    y='Model', x='IoU', data=df_iou,
+    palette=model_palette_2, hue='Model',
+    width=0.25, fliersize=2, linewidth=1.2,
+    dodge=False, legend=False
+)
+plt.grid(True, linestyle='--', linewidth=0.7, alpha=0.9)
+plt.title(f'Violin + Box Plot of Dice Scores - {dataset_tag}')
+plt.xlabel('Dice')
+plt.ylabel('Model')
+plt.tight_layout()
+plt.savefig(file_vio_dice, dpi=300)
+plt.show()
+
+# 저장
+print("\n\n✅ Violin + Box plots saved successfully:")
+print(f"    📁 Dice Violin Plot → {file_vio_box_dice}")
+print(f"    📁 IoU  Violin Plot → {file_vio_box_iou}")
+#%%
+# ==================================================
+# Paired Line Plot: Dice & IoU
+# ==================================================
+
+# 저장 경로 지정
+file_line_dice = get_unique_viz_filename(save_viz_dir, f"paired_line_dice_{tag_slug}")
+file_line_iou  = get_unique_viz_filename(save_viz_dir, f"paired_line_iou_{tag_slug}")
+
+# Dice Paired Line Plot
+plt.figure(figsize=(10, 5))
+
+for idx in df_dice['image_index'].unique():
+    sample = df_dice[df_dice['image_index'] == idx]
+    plt.plot(sample['Model'], sample['Dice'], color='gray', alpha=0.3, linewidth=0.6)
+
+sns.pointplot(
+    x='Model', y='Dice', hue='Model', data=df_dice,
+    palette=model_palette_1, errorbar='ci', linestyle='none',
+    legend=False
+)
+plt.title(f'Paired Line Plot of Dice Scores - {dataset_tag}')
+plt.xticks(rotation=20)
+plt.tight_layout()
+plt.savefig(file_line_dice, dpi=300)
+plt.show()
+
+# IoU Paired Line Plot
+plt.figure(figsize=(10, 5))
+
+for idx in df_iou['image_index'].unique():
+    sample = df_iou[df_iou['image_index'] == idx]
+    plt.plot(sample['Model'], sample['IoU'], color='gray', alpha=0.3, linewidth=0.6)
+
+sns.pointplot(
+    x='Model', y='IoU', hue='Model', data=df_iou,
+    palette=model_palette_2, errorbar='ci', linestyle='none',
+    legend=False
+)
+plt.title(f'Paired Line Plot of IoU Scores - {dataset_tag}')
+plt.xticks(rotation=20)
+plt.tight_layout()
+plt.savefig(file_line_iou, dpi=300)
+plt.show()
+
+# 저장
+print("\n\n✅ Paired line plots saved successfully:")
+print(f"    📁 Dice Paired Line Plot → {file_line_dice}")
+print(f"    📁 IoU  Paired Line Plot → {file_line_iou}")
+#%%
+# ==================================================
+# ECDF Plot: Dice & IoU
+# ==================================================
+
+# 저장 경로 지정
+file_ecdf_dice = get_unique_viz_filename(save_viz_dir, f"ecdf_dice_{tag_slug}")
+file_ecdf_iou  = get_unique_viz_filename(save_viz_dir, f"ecdf_iou_{tag_slug}")
+
+# Dice ECDF Plot
+plt.figure(figsize=(8, 5))
+sns.ecdfplot(data=df_dice, x='Dice', hue='Model', palette=model_palette_1)
+plt.title(f'ECDF Plot of Dice Scores - {dataset_tag}')
+plt.xlabel('Dice')
+plt.ylabel('Cumulative Proportion')
+plt.tight_layout()
+plt.savefig(file_ecdf_dice, dpi=300)
+plt.show()
+
+# IoU ECDF Plot
+plt.figure(figsize=(8, 5))
+sns.ecdfplot(data=df_iou, x='IoU', hue='Model', palette=model_palette_2)
+plt.title(f'ECDF Plot of IoU Scores - {dataset_tag}')
+plt.xlabel('IoU')
+plt.ylabel('Cumulative Proportion')
+plt.tight_layout()
+plt.savefig(file_ecdf_iou, dpi=300)
+plt.show()
+
+# 저장
+print("\n\n✅ ECDF plots saved successfully:")
+print(f"    📁 Dice ECDF Plot → {file_ecdf_dice}")
+print(f"    📁 IoU  ECDF Plot → {file_ecdf_iou}")
+#%%
+# ==================================================
+# KDE Plot: Dice & IoU
+# ==================================================
+
+# 저장 경로 지정
+file_kde_dice = get_unique_viz_filename(save_viz_dir, f"kde_dice_{tag_slug}")
+file_kde_iou  = get_unique_viz_filename(save_viz_dir, f"kde_iou_{tag_slug}")
+
+# Dice KDE Plot
+plt.figure(figsize=(8, 5))
+for model in df_dice['Model'].unique():
+    subset = df_dice[df_dice['Model'] == model]
+    sns.kdeplot(subset['Dice'], label=model, linewidth=2, fill=True, alpha=0.3,
+                color=model_palette_1.get(model, None))
+plt.title(f'KDE Plot of Dice Scores - {dataset_tag}')
+plt.xlabel('Dice')
+plt.ylabel('Density')
+plt.legend()
+plt.tight_layout()
+plt.savefig(file_kde_dice, dpi=300)
+plt.show()
+
+# IoU KDE Plot
+plt.figure(figsize=(8, 5))
+for model in df_iou['Model'].unique():
+    subset = df_iou[df_iou['Model'] == model]
+    sns.kdeplot(subset['IoU'], label=model, linewidth=2, fill=True, alpha=0.3,
+                color=model_palette_2.get(model, None))
+plt.title(f'KDE Plot of IoU Scores - {dataset_tag}')
+plt.xlabel('IoU')
+plt.ylabel('Density')
+plt.legend()
+plt.tight_layout()
+plt.savefig(file_kde_iou, dpi=300)
+plt.show()
+
+# 저장
+print("\n\n✅ KDE plots saved successfully:")
+print(f"    📁 Dice KDE Plot → {file_kde_dice}")
+print(f"    📁 IoU  KDE Plot → {file_kde_iou}")
+#%%
+# ==================================================
+# Histogram Plot: Dice & IoU
+# ==================================================
+
+# 저장 경로 지정
+file_hist_dice = get_unique_viz_filename(save_viz_dir, f"hist_dice_{tag_slug}")
+file_hist_iou  = get_unique_viz_filename(save_viz_dir, f"hist_iou_{tag_slug}")
+
+# Dice Histogram
+plt.figure(figsize=(8, 5))
+for model in df_dice['Model'].unique():
+    subset = df_dice[df_dice['Model'] == model]
+    sns.histplot(subset['Dice'], label=model, stat='density', bins=50,
+                 kde=False, color=model_palette_1.get(model, None),
+                 edgecolor='black', alpha=0.35 + 0.1 * (i % 3))
+plt.title(f'Histogram of Dice Scores - {dataset_tag}')
+plt.xlabel('Dice'); plt.ylabel('Density')
+plt.legend(); plt.tight_layout()
+plt.savefig(file_hist_dice, dpi=300)
+plt.show()
+
+# IoU Histogram
+plt.figure(figsize=(8, 5))
+for model in df_iou['Model'].unique():
+    subset = df_iou[df_iou['Model'] == model]
+    sns.histplot(subset['IoU'], label=model, stat='density', bins=50,
+                 kde=False, color=model_palette_2.get(model, None),
+                 edgecolor='black', alpha=0.35 + 0.1 * (i % 3))
+plt.title(f'Histogram of IoU Scores - {dataset_tag}')
+plt.xlabel('IoU'); plt.ylabel('Density')
+plt.legend(); plt.tight_layout()
+plt.savefig(file_hist_iou, dpi=300)
+plt.show()
+
+# 저장
+print("\n\n✅ Histogram plots saved successfully:")
+print(f"    📁 Dice Histogram Plot → {file_hist_dice}")
+print(f"    📁 IoU  Histogram Plot → {file_hist_iou}")
+#%%
+# ==================================================
+# Histogram + KDE Plot: Dice & IoU
+# ==================================================
+
+# 저장 경로 지정
+file_hist_kde_dice = get_unique_viz_filename(save_viz_dir, f"hist_kde_dice_{tag_slug}")
+file_hist_kde_iou  = get_unique_viz_filename(save_viz_dir, f"hist_kde_iou_{tag_slug}")
+
+# Dice Histogram
+plt.figure(figsize=(8, 5))
+for model in df_dice['Model'].unique():
+    subset = df_dice[df_dice['Model'] == model]
+    sns.histplot(subset['Dice'], label=model, stat='density', bins=50,
+                 kde=False, color=model_palette_1.get(model, None),
+                 edgecolor='black', alpha=0.35 + 0.1 * (i % 3))
+    sns.kdeplot(
+        subset['Dice'],
+        color=model_palette_1[model],
+        lw=2, alpha=0.9
+    )
+plt.title(f'Histogram + KDE of Dice Scores - {dataset_tag}')
+plt.xlabel('Dice'); plt.ylabel('Density')
+plt.legend(); plt.tight_layout()
+plt.savefig(file_hist_dice, dpi=300)
+plt.show()
+
+# IoU Histogram
+plt.figure(figsize=(8, 5))
+for model in df_iou['Model'].unique():
+    subset = df_iou[df_iou['Model'] == model]
+    sns.histplot(subset['IoU'], label=model, stat='density', bins=50,
+                 kde=False, color=model_palette_2.get(model, None),
+                 edgecolor='black', alpha=0.35 + 0.1 * (i % 3))
+    sns.kdeplot(
+        subset['IoU'],
+        color=model_palette_2[model],
+        lw=2, alpha=0.9
+    )
+plt.title(f'Histogram + KDE of IoU Scores - {dataset_tag}')
+plt.xlabel('IoU'); plt.ylabel('Density')
+plt.legend(); plt.tight_layout()
+plt.savefig(file_hist_iou, dpi=300)
+plt.show()
+
+# 저장
+print("\n\n✅ Histogram + KDE plots saved successfully:")
+print(f"    📁 Dice Histogram Plot → {file_hist_kde_dice}")
+print(f"    📁 IoU  Histogram Plot → {file_hist_kde_iou}")
