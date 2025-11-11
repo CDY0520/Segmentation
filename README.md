@@ -34,6 +34,8 @@ Skin lesion (피부 병변 부위)
 ---
 
 # 폴더 구조
+
+```
 Segmentation/
 │
 ├── analysis/                     # 성능 고도화 및 일반화 실험 분석 코드
@@ -64,6 +66,7 @@ Segmentation/
 │   └── transunet.py
 │
 └── README.md
+```
 
 ---
 
